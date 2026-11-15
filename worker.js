@@ -49,6 +49,22 @@ export default {
         }, 400);
       }
     }
+  // MIANTOCLIP - Director Inteligente
+  if (path === "/director" && request.method === "POST") {
+    try {
+      const body = await request.json();
+      const plan = crearDirector({
+        idea: body.idea,
+        tipo: body.tipo || "historia",
+        duracion: body.duracion || 60,
+        imagen: Boolean(body.imagen)
+      });
+      return json(plan);
+    } catch (error) {
+      return json({ error: String(error.message) }, 400);
+    }
+  }
+
 
     // Comprobación del servidor
     if (path === "/health" && request.method === "GET") {
