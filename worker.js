@@ -1,4 +1,4 @@
-
+import { crearDirector } from "./director.js";
 import { crearPlanDocumental } from "./documentales.js";
 
 const API = "https://api.dev.runwayml.com/v1";
