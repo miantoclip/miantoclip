@@ -1,14 +1,13 @@
 
-// MIAntoClip - Cloudflare Worker independiente
-
-const API = "https://api.dev.runwayml.com/v1";
-const VERSION = "2024-11-06";
+const RUNWAY_API = "https://api.dev.runwayml.com/v1";
+const NURETA_API = "https://developer.nureta.ai";
+const RUNWAY_VERSION = "2024-11-06";
 const MAX_SECONDS = 900;
 
 const CORS = {
   "Access-Control-Allow-Origin": "*",
   "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
-  "Access-Control-Allow-Headers": "Content-Type"
+  "Access-Control-Allow-Headers": "Content-Type, Authorization"
 };
 
 function json(data, status = 200) {
@@ -22,76 +21,84 @@ function json(data, status = 200) {
   });
 }
 
-function message(data, fallback) {
-  const value =
-    data?.error || data?.message || data?.failure || fallback;
-
+function errorMessage(data, fallback) {
+  const value = data?.error || data?.message || fallback;
   return typeof value === "string"
     ? value
     : JSON.stringify(value);
 }
 
 function validHttps(value) {
-  return (
-    typeof value === "string" &&
+  return typeof value === "string" &&
     /^https:\/\/[^\s]+$/i.test(value) &&
-    value.length <= 2048
-  );
+    value.length <= 2048;
 }
 
 function validImage(value) {
-  return (
-    typeof value === "string" &&
+  return typeof value === "string" &&
     value.length <= 5700000 &&
     (
-      /^data:image\/(png|jpeg|webp);base64,[A-Za-z0-9+/=]+$/.test(value) ||
-      validHttps(value)
-    )
-  );
+      validHttps(value) ||
+      /^data:image\/(png|jpeg|webp);base64,[A-Za-z0-9+/=]+$/.test(value)
+    );
 }
 
-function durationValid(value, min = 30, max = MAX_SECONDS) {
-  return (
-    Number.isInteger(value) &&
-    value >= min &&
-    value <= max &&
-    value % 5 === 0
-  );
+function validDuration(value) {
+  return Number.isInteger(value) &&
+    value >= 30 &&
+    value <= MAX_SECONDS &&
+    value % 5 === 0;
 }
 
-function segmentsFor(seconds) {
-  const segments = [];
+function scenesFor(duration) {
+  const scenes = [];
+  let remaining = duration;
 
-  for (let remaining = seconds; remaining > 0;) {
-    const duration = remaining >= 10 ? 10 : 5;
-
-    segments.push({
-      number: segments.length + 1,
-      duration
+  while (remaining > 0) {
+    const seconds = remaining >= 10 ? 10 : 5;
+    scenes.push({
+      scene: scenes.length + 1,
+      seconds,
+      status: "pending"
     });
-
-    remaining -= duration;
+    remaining -= seconds;
   }
 
-  return segments;
+  return scenes;
 }
 
-async function runway(env, endpoint, payload, method = "POST") {
-  const response = await fetch(API + endpoint, {
-    method,
-    headers: {
-      Authorization: `Bearer ${env.RUNWAYML_API_SECRET}`,
-      "X-Runway-Version": VERSION,
-      ...(method === "POST"
-        ? { "Content-Type": "application/json" }
-        : {})
-    },
-    ...(method === "POST"
-      ? { body: JSON.stringify(payload) }
-      : {})
+function authorized(request, env) {
+  return Boolean(env.MIANTOCLIP_ADMIN_TOKEN) &&
+    request.headers.get("Authorization") ===
+      `Bearer ${env.MIANTOCLIP_ADMIN_TOKEN}`;
+}
+
+async function callApi(base, path, key, body, runway = false) {
+  const headers = {
+    Authorization: `Bearer ${key}`,
+    "Content-Type": "application/json"
+  };
+
+  if (runway) {
+    headers["X-Runway-Version"] = RUNWAY_VERSION;
+  }
+
+  const response = await fetch(base + path, {
+    method: body === undefined ? "GET" : "POST",
+    headers,
+    ...(body === undefined
+      ? {}
+      : { body: JSON.stringify(body) })
   });
 
-  const data = await response.json().catch(() => ({}));
+  const raw = await response.text();
+  let data;
+
+  try {
+    data = raw ? JSON.parse(raw) : {};
+  } catch {
+    data = { message: raw.slice(0, 400) };
+  }
 
   return {
     ok: response.ok,
@@ -100,84 +107,453 @@ async function runway(env, endpoint, payload, method = "POST") {
   };
 }
 
-function taskResponse(result, kind, notice) {
-  if (!result.ok) {
-    return json({
-      error: message(
-        result.data,
-        "El proveedor rechazó la solicitud"
-      ),
-      details: result.data?.issues || null
-    }, result.status);
-  }
-
+function upstreamError(result, fallback) {
   return json({
-    id: result.data?.id,
-    kind,
-    notice
-  });
+    error: errorMessage(result.data, fallback),
+    details: result.data
+  }, result.status);
 }
 
-function director(body) {
-  const idea = String(body.idea || "").trim();
-  const duration = Number(body.duracion ?? 60);
+async function readBody(request) {
+  try {
+    const body = await request.json();
 
-  if (
-    !idea ||
-    idea.length > 2000 ||
-    !durationValid(duration)
-  ) {
-    return json({
-      error: "Indica una idea y duración de 30 a 900 segundos, múltiplo de 5"
-    }, 400);
+    if (
+      !body ||
+      typeof body !== "object" ||
+      Array.isArray(body)
+    ) {
+      return null;
+    }
+
+    return body;
+  } catch {
+    return null;
   }
-
-  const segments = segmentsFor(duration);
-
-  return json({
-    idea,
-    tipo: String(body.tipo || "historia"),
-    duracion: duration,
-    imagen: Boolean(body.imagen),
-    escenas: segments.map(s => ({
-      ...s,
-      instruccion: `Continuar la historia: ${idea}`,
-      estado: "pendiente"
-    })),
-    notice: "Guion técnico orientativo; no genera ni monta el vídeo."
-  });
 }
 
-function documental(body) {
-  const tema = String(
-    body.tema || "Las pirámides de Egipto"
+function planVideo(body) {
+  const duration = Number(
+    body.duration ?? body.duracion ?? 60
+  );
+
+  const prompt = String(
+    body.prompt || body.idea || body.tema || ""
   ).trim();
 
-  const duration = Number(body.duracion ?? 420);
-
-  if (
-    !tema ||
-    tema.length > 2000 ||
-    !durationValid(duration)
-  ) {
+  if (!validDuration(duration)) {
     return json({
-      error: "Tema o duración no válidos (30–900 segundos, múltiplo de 5)"
+      error: "Duracion entre 30 y 900 segundos, multiplo de 5"
+    }, 400);
+  }
+
+  if (!prompt || prompt.length > 2000) {
+    return json({
+      error: "Falta una descripcion valida"
     }, 400);
   }
 
   return json({
-    tema,
-    idioma: String(body.idioma || "es"),
-    duracion: duration,
-    segmentos: segmentsFor(duration),
-    estructura: [
-      "Introducción",
-      "Contexto",
-      "Desarrollo",
-      "Conclusión"
-    ],
-    notice: "Esquema inicial; requiere investigación, narración y montaje."
+    ok: true,
+    prompt,
+    duration,
+    scenes: scenesFor(duration),
+    audio: "pending",
+    videoAssembly: "pending",
+    notice: "Plan tecnico. No genera ni monta el video."
   });
+}
+
+async function handleRunway(path, body, env) {
+  if (!env.RUNWAYML_API_SECRET) {
+    return json({
+      error: "Falta RUNWAYML_API_SECRET"
+    }, 503);
+  }
+
+  const call = (endpoint, payload) =>
+    callApi(
+      RUNWAY_API,
+      endpoint,
+      env.RUNWAYML_API_SECRET,
+      payload,
+      true
+    );
+
+  if (path === "/generate" || path === "/segment") {
+    const prompt = String(
+      body.prompt || body.promptText || ""
+    ).trim();
+
+    const image = body.image || body.promptImage;
+
+    const duration = Number(
+      body.segmentDuration ?? body.duration ?? 10
+    );
+
+    const ratio = body.ratio || "1280:720";
+
+    if (!prompt || prompt.length > 1000) {
+      return json({
+        error: "Descripcion no valida"
+      }, 400);
+    }
+
+    if (!validImage(image)) {
+      return json({
+        error: "Imagen HTTPS o base64 no valida"
+      }, 400);
+    }
+
+    if (![5, 10].includes(duration)) {
+      return json({
+        error: "Runway admite segmentos de 5 o 10 segundos"
+      }, 400);
+    }
+
+    if (!["1280:720", "720:1280"].includes(ratio)) {
+      return json({
+        error: "Formato no valido"
+      }, 400);
+    }
+
+    const result = await call("/image_to_video", {
+      model: "gen4_turbo",
+      promptText: prompt,
+      promptImage: image,
+      duration,
+      ratio
+    });
+
+    if (!result.ok) {
+      return upstreamError(result, "Error generando video");
+    }
+
+    return json({
+      id: result.data.id,
+      status: result.data.status || "PENDING",
+      engine: "runway",
+      kind: "video-segment",
+      segmentDuration: duration
+    });
+  }
+
+  if (path === "/voice") {
+    const spoken = String(body.text || "").trim();
+
+    if (!spoken || spoken.length > 2048) {
+      return json({
+        error: "Texto de voz no valido"
+      }, 400);
+    }
+
+    const result = await call("/text_to_speech", {
+      model: "eleven_v3",
+      promptText: spoken
+    });
+
+    if (!result.ok) {
+      return upstreamError(result, "Error generando voz");
+    }
+
+    return json({
+      id: result.data.id,
+      kind: "voice",
+      notice: "Audio independiente, pendiente de montaje."
+    });
+  }
+
+  if (path === "/music") {
+    const prompt = String(body.prompt || "").trim();
+    const duration = Number(body.duration);
+
+    if (!prompt || prompt.length > 4100) {
+      return json({
+        error: "Descripcion musical no valida"
+      }, 400);
+    }
+
+    if (
+      !Number.isInteger(duration) ||
+      duration < 3 ||
+      duration > 600
+    ) {
+      return json({
+        error: "Duracion musical entre 3 y 600 segundos"
+      }, 400);
+    }
+
+    const result = await call("/text_to_music", {
+      model: "eleven_music_v2_5",
+      promptText: prompt,
+      duration,
+      instrumental: body.instrumental !== false
+    });
+
+    if (!result.ok) {
+      return upstreamError(result, "Error generando musica");
+    }
+
+    return json({
+      id: result.data.id,
+      kind: "music",
+      notice: "Pista independiente, pendiente de montaje."
+    });
+  }
+
+  if (path === "/video-sound") {
+    if (!validHttps(body.videoUri)) {
+      return json({
+        error: "URL HTTPS del video no valida"
+      }, 400);
+    }
+
+    const duration = Number(body.duration);
+
+    if (
+      !Number.isFinite(duration) ||
+      duration < 1 ||
+      duration > 600
+    ) {
+      return json({
+        error: "Duracion de sonido entre 1 y 600 segundos"
+      }, 400);
+    }
+
+    const payload = {
+      model: "mirelo_sfx_2_0",
+      videoUri: body.videoUri,
+      duration,
+      preserveSpeech: Boolean(body.preserveSpeech)
+    };
+
+    if (body.prompt) {
+      payload.promptText =
+        String(body.prompt).slice(0, 2000);
+    }
+
+    const result = await call("/video_to_audio", payload);
+
+    if (!result.ok) {
+      return upstreamError(result, "Error generando sonido");
+    }
+
+    return json({
+      id: result.data.id,
+      kind: "sound",
+      notice: "Audio independiente, pendiente de montaje."
+    });
+  }
+
+  if (path === "/status") {
+    const id = String(body.id || "");
+
+    if (!/^[a-f0-9-]{36}$/i.test(id)) {
+      return json({ error: "ID no valido" }, 400);
+    }
+
+    const result = await call(
+      "/tasks/" + encodeURIComponent(id)
+    );
+
+    if (!result.ok) {
+      return upstreamError(result, "Error consultando Runway");
+    }
+
+    return json({
+      status: result.data.status,
+      output: result.data.output || [],
+      failure:
+        result.data.failure ||
+        result.data.failureCode ||
+        null
+    });
+  }
+
+  return json({ error: "Ruta Runway no encontrada" }, 404);
+}
+
+async function handleNureta(path, body, env) {
+  const call = (endpoint, payload) =>
+    callApi(
+      NURETA_API,
+      endpoint,
+      env.NURETA_API_KEY,
+      payload
+    );
+
+  const base = "/api/v3/contents/generations/tasks";
+
+  if (path === "/nureta/check") {
+    const result = await call(
+      base + "?limit=20&offset=0"
+    );
+
+    return json({
+      ok: result.ok,
+      engine: "nureta",
+      upstreamStatus: result.status,
+      authenticationAccepted: result.ok,
+      message: result.ok
+        ? "Nureta responde correctamente"
+        : "Nureta devolvio un error",
+      ...(result.ok ? {} : { details: result.data })
+    }, result.ok ? 200 : result.status);
+  }
+
+  if (path === "/nureta/status") {
+    const id = String(body.id || "");
+
+    if (!/^cgt-[a-zA-Z0-9_-]+$/.test(id)) {
+      return json({
+        error: "ID Nureta no valido"
+      }, 400);
+    }
+
+    const result = await call(
+      base + "/" + encodeURIComponent(id)
+    );
+
+    if (!result.ok) {
+      return upstreamError(
+        result,
+        "Error consultando Nureta"
+      );
+    }
+
+    return json({
+      id: result.data.id,
+      status: result.data.status,
+      video_url:
+        result.data.content?.video_url ||
+        result.data.video_url ||
+        null,
+      media: result.data.media || [],
+      segments: result.data.segments || [],
+      step: result.data.step || null,
+      usage: result.data.usage || null,
+      error: result.data.error || null
+    });
+  }
+
+  if (path === "/nureta/generate") {
+    if (body.confirmed_adult !== true) {
+      return json({
+        error: "Se requiere confirmacion de mayoria de edad"
+      }, 403);
+    }
+
+    const prompt = String(body.prompt || "").trim();
+    const duration = Number(body.duration ?? 5);
+    const model = body.model || "seahorse-480p";
+    const ratio = body.ratio || "9:16";
+
+    if (!prompt || prompt.length > 1000) {
+      return json({
+        error: "Descripcion no valida"
+      }, 400);
+    }
+
+    const models = [
+      "seahorse-480p",
+      "seahorse-720p",
+      "seahorse-1080p"
+    ];
+
+    if (!models.includes(model)) {
+      return json({
+        error: "Modelo Nureta no valido"
+      }, 400);
+    }
+
+    const ratios = [
+      "16:9", "9:16", "4:3",
+      "3:4", "1:1", "21:9", "adaptive"
+    ];
+
+    if (!ratios.includes(ratio)) {
+      return json({
+        error: "Formato Nureta no valido"
+      }, 400);
+    }
+
+    const allowedDuration =
+      Number.isInteger(duration) &&
+      (
+        [5, 8, 10, 12, 15].includes(duration) ||
+        (duration >= 16 && duration <= 180)
+      );
+
+    if (!allowedDuration) {
+      return json({
+        error: "Duracion Nureta no valida"
+      }, 400);
+    }
+
+    const firstImage = String(
+      body.image_url ||
+      body.first_frame_url ||
+      ""
+    );
+
+    const lastImage = String(
+      body.last_frame_url || ""
+    );
+
+    for (const url of [firstImage, lastImage]) {
+      if (url && !validHttps(url)) {
+        return json({
+          error: "Las imagenes deben usar URL HTTPS"
+        }, 400);
+      }
+    }
+
+    const content = [
+      {
+        type: "text",
+        text: prompt
+      },
+      ...(firstImage ? [{
+        type: "image_url",
+        image_url: { url: firstImage },
+        role: "first_frame"
+      }] : []),
+      ...(lastImage ? [{
+        type: "image_url",
+        image_url: { url: lastImage },
+        role: "last_frame"
+      }] : [])
+    ];
+
+    const payload = {
+      model,
+      content,
+      ratio,
+      duration,
+      generate_audio: body.generate_audio !== false,
+      ...(duration > 15 ? { auto_chain: true } : {})
+    };
+
+    const result = await call(base, payload);
+
+    if (!result.ok) {
+      return upstreamError(
+        result,
+        "Nureta rechazo la solicitud"
+      );
+    }
+
+    return json({
+      id: result.data.id,
+      status: result.data.status,
+      engine: "nureta",
+      usage: result.data.usage || null
+    });
+  }
+
+  return json({
+    error: "Ruta Nureta no encontrada"
+  }, 404);
 }
 
 export default {
@@ -195,11 +571,16 @@ export default {
     if (path === "/health" && request.method === "GET") {
       return json({
         ok: true,
-        service: "MIAntoClip",
-        version: "worker-independiente-v2",
+        service: "MIAntoClip API",
+        version: "unified-v3",
         runwayConfigured: Boolean(env.RUNWAYML_API_SECRET),
+        nuretaConfigured: Boolean(env.NURETA_API_KEY),
+        adultAccessConfigured:
+          Boolean(env.MIANTOCLIP_ADMIN_TOKEN),
         minDuration: 30,
-        maxDuration: MAX_SECONDS
+        maxDuration: MAX_SECONDS,
+        audio: "pending",
+        videoAssembly: "pending"
       });
     }
 
@@ -209,270 +590,77 @@ export default {
       }, 404);
     }
 
-    let body;
+    const nuretaRoutes = [
+      "/nureta/check",
+      "/nureta/generate",
+      "/nureta/status"
+    ];
 
-    try {
-      body = await request.json();
-
-      if (
-        !body ||
-        typeof body !== "object" ||
-        Array.isArray(body)
-      ) {
-        throw Error();
+    if (nuretaRoutes.includes(path)) {
+      if (!env.NURETA_API_KEY) {
+        return json({
+          error: "Falta NURETA_API_KEY"
+        }, 503);
       }
-    } catch {
+
+      if (!authorized(request, env)) {
+        return json({
+          error: "Acceso no autorizado"
+        }, 401);
+      }
+    }
+
+    if (path === "/nureta/check") {
+      try {
+        return await handleNureta(path, {}, env);
+      } catch (e) {
+        return json({
+          error: "Error de conexion con Nureta"
+        }, 502);
+      }
+    }
+
+    const body = await readBody(request);
+
+    if (!body) {
       return json({
-        error: "Envía un objeto JSON válido"
+        error: "Envia un objeto JSON valido"
       }, 400);
     }
 
-    if (path === "/director") {
-      return director(body);
+    if (
+      path === "/plan" ||
+      path === "/director" ||
+      path === "/documentales"
+    ) {
+      return planVideo(body);
     }
 
-    if (path === "/documentales") {
-      return documental(body);
-    }
-
-    if (path === "/plan") {
-      const duration = Number(body.duration);
-
-      if (!durationValid(duration)) {
-        return json({
-          error: "Elige entre 30 y 900 segundos, en múltiplos de 5"
-        }, 400);
-      }
-
-      const segments = segmentsFor(duration);
-
-      return json({
-        duration,
-        segments,
-        totalSegments: segments.length,
-        notice: "Plan de producción. La continuidad, generación por lotes y montaje final aún no están automatizados."
-      });
-    }
-
-    const routes = [
+    const runwayRoutes = [
       "/generate",
       "/segment",
       "/voice",
-      "/video-sound",
       "/music",
+      "/video-sound",
       "/status"
     ];
 
-    if (!routes.includes(path)) {
+    try {
+      if (runwayRoutes.includes(path)) {
+        return await handleRunway(path, body, env);
+      }
+
+      if (nuretaRoutes.includes(path)) {
+        return await handleNureta(path, body, env);
+      }
+
       return json({
         error: "Ruta no encontrada"
       }, 404);
-    }
-
-    if (!env.RUNWAYML_API_SECRET) {
-      return json({
-        error: "Falta configurar RUNWAYML_API_SECRET"
-      }, 503);
-    }
-
-    try {
-      if (path === "/generate" || path === "/segment") {
-        const prompt = String(body.prompt || "").trim();
-
-        const duration = Number(
-          body.segmentDuration ?? body.duration ?? 10
-        );
-
-        const ratio = body.ratio || "1280:720";
-
-        if (!prompt || prompt.length > 1000) {
-          return json({
-            error: "Descripción no válida (1–1000 caracteres)"
-          }, 400);
-        }
-
-        if (![5, 10].includes(duration)) {
-          return json({
-            error: "Los fragmentos técnicos deben durar 5 o 10 segundos"
-          }, 400);
-        }
-
-        if (!["1280:720", "720:1280"].includes(ratio)) {
-          return json({
-            error: "Formato no válido"
-          }, 400);
-        }
-
-        if (!validImage(body.image)) {
-          return json({
-            error: "Imagen base64 o URL HTTPS no válida, o demasiado grande"
-          }, 400);
-        }
-
-        const result = await runway(
-          env,
-          "/image_to_video",
-          {
-            model: "gen4_turbo",
-            promptText: prompt,
-            promptImage: body.image,
-            duration,
-            ratio
-          }
-        );
-
-        if (!result.ok) {
-          return taskResponse(
-            result,
-            "video-segment"
-          );
-        }
-
-        return json({
-          id: result.data?.id,
-          kind: "video-segment",
-          segmentDuration: duration,
-          notice: "Tarea enviada. Consulta /status; todavía no es un vídeo final montado."
-        });
-      }
-
-      if (path === "/voice") {
-        const spoken = String(body.text || "").trim();
-
-        if (!spoken || spoken.length > 2048) {
-          return json({
-            error: "Texto de voz: entre 1 y 2048 caracteres"
-          }, 400);
-        }
-
-        return taskResponse(
-          await runway(
-            env,
-            "/text_to_speech",
-            {
-              model: "eleven_v3",
-              promptText: spoken
-            }
-          ),
-          "voice",
-          "Audio independiente; falta mezclarlo con el vídeo."
-        );
-      }
-
-      if (path === "/video-sound") {
-        if (!validHttps(body.videoUri)) {
-          return json({
-            error: "Indica una URL HTTPS del vídeo"
-          }, 400);
-        }
-
-        const duration = Number(body.duration);
-
-        if (
-          !Number.isFinite(duration) ||
-          duration < 1 ||
-          duration > 600
-        ) {
-          return json({
-            error: "Duración de sonido entre 1 y 600 segundos"
-          }, 400);
-        }
-
-        const payload = {
-          model: "mirelo_sfx_2_0",
-          videoUri: body.videoUri,
-          duration,
-          preserveSpeech: Boolean(body.preserveSpeech)
-        };
-
-        if (body.prompt) {
-          payload.promptText =
-            String(body.prompt).slice(0, 2000);
-        }
-
-        return taskResponse(
-          await runway(
-            env,
-            "/video_to_audio",
-            payload
-          ),
-          "sound",
-          "El audio debe incorporarse durante el montaje."
-        );
-      }
-
-      if (path === "/music") {
-        const prompt = String(body.prompt || "").trim();
-        const duration = Number(body.duration);
-
-        if (!prompt || prompt.length > 4100) {
-          return json({
-            error: "Describe la música (máximo 4100 caracteres)"
-          }, 400);
-        }
-
-        if (
-          !Number.isInteger(duration) ||
-          duration < 3 ||
-          duration > 600
-        ) {
-          return json({
-            error: "La música admite entre 3 y 600 segundos por tarea"
-          }, 400);
-        }
-
-        return taskResponse(
-          await runway(
-            env,
-            "/text_to_music",
-            {
-              model: "eleven_music_v2_5",
-              promptText: prompt,
-              duration,
-              instrumental: body.instrumental !== false
-            }
-          ),
-          "music",
-          "Pista independiente; falta mezclarla con el vídeo."
-        );
-      }
-
-      const id = String(body.id || "");
-
-      if (!/^[a-f0-9-]{36}$/i.test(id)) {
-        return json({
-          error: "Identificador no válido"
-        }, 400);
-      }
-
-      const result = await runway(
-        env,
-        "/tasks/" + encodeURIComponent(id),
-        undefined,
-        "GET"
-      );
-
-      if (!result.ok) {
-        return json({
-          error: message(
-            result.data,
-            "Error consultando Runway"
-          )
-        }, result.status);
-      }
-
-      return json({
-        status: result.data.status,
-        output: result.data.output || [],
-        failure:
-          result.data.failure ||
-          result.data.failureCode ||
-          null
-      });
 
     } catch (e) {
       return json({
-        error: String(e?.message || e)
+        error: "Error comunicando con el proveedor"
       }, 502);
     }
   }
